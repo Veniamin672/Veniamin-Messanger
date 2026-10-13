@@ -1,0 +1,7 @@
+websockets>=12.0
+aiofiles>=23.0
+aiocron>=1.8
+uuid6>=2024.1
+python-dateutil>=2.8
+Pillow>=10.0
+aiohttp>=3.9
