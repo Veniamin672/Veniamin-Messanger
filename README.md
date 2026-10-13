@@ -50,14 +50,18 @@ veniamin/
 ```bash
 cd server
 python -m venv venv
+
 # Windows:
 venv\Scripts\activate
+
 # Linux/macOS:
 source venv/bin/activate
 
 pip install -r requirements.txt
 python server.py
 ```
+
+Или файлом run.bat на Windows и run.sh на Linux
 
 Сервер слушает `0.0.0.0:8765` (настраивается в `config.py`).
 
@@ -72,7 +76,7 @@ python server.py
 
 ---
 
-## Запуск клиента (Flutter)
+## Запуск клиента для разработчиков (Flutter)
 
 Требуется Flutter SDK ≥ 3.16.
 
@@ -82,12 +86,31 @@ flutter pub get
 flutter run -d windows    # или android / ios / macos
 ```
 
+## Запуск клиента для пользователей
+
+На телефоне:
+Скачиваете `app-release.apk` и запускаете
+
+На Windows/Linux:
+В папке `Output` запускаете файл `veniamin_setup.exe`
+
 ### Первый экран
 
 1. Поле **server IP / host**
-2. **port** (по умолчанию 8765)
+   (Что бы узнать свой IP сервера на Windows в консольной строке пишете:
+```bash
+ipconfig
+```
+И в Wireless `LAN adapter WiFi:` найдите `IPv4 Address`, там и будет указан ваш ip
+На Linux:
+```bash
+hostname -I
+```
+)
+2. **port** (по умолчанию 8765, но можно изменить в `server/config.py`)
 3. **display name**
 4. Отображается **device_uuid** (можно скопировать)
+5. Отображается **account_id** (также можно скопировать, нужен для смены аккаунта)
 5. Кнопка `> connect`
 
 После подключения:
@@ -125,7 +148,7 @@ flutter run -d windows    # или android / ios / macos
 ## Голосовые звонки
 
 1. Пользователь нажимает иконку звонка рядом с онлайн-пользователем.
-2. Клиент создаёт WebRTC PeerConnection (только audio).
+2. Клиент создаёт WebRTC PeerConnection (только audio, пока что).
 3. SDP offer / answer / ICE передаются через сервер JSON-пакетами.
 4. STUN: `stun:stun.l.google.com:19302` (для NAT).
 5. Для сложных NAT может понадобиться свой TURN-сервер.
@@ -149,11 +172,12 @@ flutter run -d windows    # или android / ios / macos
 ## Дальнейшие шаги
 
 - [ ] Chunked upload больших файлов
-- [ ] Скачивание медиа по media_id
 - [ ] Push-уведомления (FCM / APNs)
 - [ ] Локальное хранение истории на клиенте
-- [ ] Emoji / реакции
 - [ ] Групповые звонки (SFU)
+- [ ] Закрепление сообщений для сохранения на большее количество времени
+- [ ] Демонстрация экрана в звонке
+- [ ] Веб-камера в звонке
 
 ---
 
@@ -161,7 +185,7 @@ flutter run -d windows    # или android / ios / macos
 
 ---
 
-## Раздача друзьям (сборки)
+## Раздача друзьям для разработчиков(сборки)
 
 ### Windows
 ```bash
@@ -200,5 +224,5 @@ flutter build ipa --release
 - Группы (создание всем, add/remove участников; админа сервера нельзя удалить)
 - Отправка и скачивание файлов
 - Admin: system broadcast всем
-- Admin: полный сброс сообщений (пароль `4593`)
+- Admin: полный сброс сообщений (пароль `4593` можно настроить через server/config.py)
 - Тема: #1E1E1E / #252526 / #007c42 / #D4D4D4 / #808080
