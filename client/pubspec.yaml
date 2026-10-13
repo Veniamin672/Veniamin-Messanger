@@ -1,0 +1,46 @@
+name: veniamin
+description: Closed group messenger Veniamin — terminal/IDE style
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.0
+  uuid: ^4.4.0
+  shared_preferences: ^2.3.0
+  path_provider: ^2.1.0
+  file_picker: 10.3.10
+  flutter_webrtc: ^1.5.2
+  intl: ^0.19.0
+  collection: ^1.18.0
+  crypto: ^3.0.0
+  path: ^1.9.0
+  video_player: ^2.9.2
+  audioplayers: ^6.1.0
+  image_picker: ^1.1.2
+  flutter_local_notifications: ^18.0.1
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon.png
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  windows:
+    generate: true
+  image_path: "assets/icon.png"
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: "assets/icon.png"
