@@ -32,7 +32,7 @@ MAX_USERS = 20
 MAX_GROUPS = 50
 
 # Admin hard-coded reset password
-ADMIN_RESET_PASSWORD = "4593"
+ADMIN_RESET_PASSWORD = "3648"
 
 # Default global group id
 GLOBAL_GROUP_ID = "global"
