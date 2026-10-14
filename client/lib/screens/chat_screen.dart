@@ -1145,6 +1145,12 @@ class _ChatScreenState extends State<ChatScreen> {
               },
               onReject: () => conn.rejectCall(),
             ),
+          if (conn.pins.isNotEmpty)
+            _PinnedBar(
+              pins: conn.pins,
+              onTap: (id) => _jumpToMessage(id),
+              onUnpin: (id) => conn.unpinMessage(id),
+            ),
           Expanded(
             child: Row(
               children: [
@@ -1164,6 +1170,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             final isMe = m.fromUuid == DeviceId.uuid ||
                                 m.fromUuid == (conn.me?.uuid ?? '') ||
                                 m.fromUuid == (conn.me?.accountId ?? '');
+                            final isPinned = conn.pins.any((p) => p.messageId == m.id) || m.pinned;
                             return KeyedSubtree(
                               key: _keyForMessage(m.id),
                               child: _MessageBubble(
@@ -1182,6 +1189,14 @@ class _ChatScreenState extends State<ChatScreen> {
                                   : null,
                               onTapReply: m.replyTo != null
                                   ? () => _jumpToMessage(m.replyTo!.id)
+                                  : null,
+                              onPin: (!isPinned &&
+                                      m.msgType != 'system' &&
+                                      m.msgType != 'date')
+                                  ? () => conn.pinMessage(m.id)
+                                  : null,
+                              onUnpin: isPinned
+                                  ? () => conn.unpinMessage(m.id)
                                   : null,
                             ),
                             );
@@ -1307,6 +1322,112 @@ class _ChatScreenState extends State<ChatScreen> {
 }
 
 
+
+class _PinnedBar extends StatefulWidget {
+  final List<PinnedEntry> pins;
+  final void Function(String messageId) onTap;
+  final void Function(String messageId) onUnpin;
+
+  const _PinnedBar({
+    required this.pins,
+    required this.onTap,
+    required this.onUnpin,
+  });
+
+  @override
+  State<_PinnedBar> createState() => _PinnedBarState();
+}
+
+class _PinnedBarState extends State<_PinnedBar> {
+  int _index = 0;
+
+  @override
+  void didUpdateWidget(covariant _PinnedBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_index >= widget.pins.length) {
+      _index = widget.pins.isEmpty ? 0 : widget.pins.length - 1;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.pins.isEmpty) return const SizedBox.shrink();
+    final i = _index.clamp(0, widget.pins.length - 1);
+    final p = widget.pins[i];
+    return Material(
+      color: const Color(0xFF252526),
+      elevation: 2,
+      child: InkWell(
+        onTap: () => widget.onTap(p.messageId),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.push_pin, size: 16, color: VColors.yellow),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.pins.length > 1
+                          ? 'Закреплённые (${i + 1}/${widget.pins.length})'
+                          : 'Закреплённое',
+                      style: const TextStyle(
+                        color: VColors.yellow,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Text(
+                      p.fromName.isNotEmpty
+                          ? '${p.fromName}: ${p.preview}'
+                          : p.preview,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: VColors.text,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (widget.pins.length > 1)
+                IconButton(
+                  icon: const Icon(Icons.chevron_left, size: 20, color: VColors.dim),
+                  onPressed: () {
+                    setState(() {
+                      _index = (_index - 1 + widget.pins.length) % widget.pins.length;
+                    });
+                  },
+                  visualDensity: VisualDensity.compact,
+                ),
+              if (widget.pins.length > 1)
+                IconButton(
+                  icon: const Icon(Icons.chevron_right, size: 20, color: VColors.dim),
+                  onPressed: () {
+                    setState(() {
+                      _index = (_index + 1) % widget.pins.length;
+                    });
+                  },
+                  visualDensity: VisualDensity.compact,
+                ),
+              IconButton(
+                icon: const Icon(Icons.close, size: 18, color: VColors.dim),
+                tooltip: 'открепить',
+                onPressed: () => widget.onUnpin(p.messageId),
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _IncomingCallBanner extends StatelessWidget {
   final String name;
   final VoidCallback onAccept;
@@ -1401,6 +1522,8 @@ class _MessageBubble extends StatelessWidget {
   final VoidCallback? onReply;
   final VoidCallback? onEdit;
   final VoidCallback? onTapReply;
+  final VoidCallback? onPin;
+  final VoidCallback? onUnpin;
   const _MessageBubble({
     required this.msg,
     required this.isMe,
@@ -1411,6 +1534,8 @@ class _MessageBubble extends StatelessWidget {
     this.onReply,
     this.onEdit,
     this.onTapReply,
+    this.onPin,
+    this.onUnpin,
   });
 
   bool get _isImage {
@@ -1532,6 +1657,26 @@ class _MessageBubble extends StatelessWidget {
                 onTap: () {
                   Navigator.pop(ctx);
                   onEdit!();
+                },
+              ),
+            if (onPin != null)
+              ListTile(
+                leading: const Icon(Icons.push_pin, color: VColors.yellow, size: 20),
+                title: const Text('Закрепить',
+                    style: TextStyle(color: VColors.text)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onPin!();
+                },
+              ),
+            if (onUnpin != null)
+              ListTile(
+                leading: const Icon(Icons.push_pin_outlined, color: VColors.dim, size: 20),
+                title: const Text('Открепить',
+                    style: TextStyle(color: VColors.text)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onUnpin!();
                 },
               ),
             if (canCopy)
@@ -1711,6 +1856,24 @@ class _MessageBubble extends StatelessWidget {
                   ),
               ],
             ),
+            if (msg.pinned || (msg.pinnedAt != null))
+              const Padding(
+                padding: EdgeInsets.only(left: 8, top: 2),
+                child: Row(
+                  children: [
+                    Icon(Icons.push_pin, size: 10, color: VColors.yellow),
+                    SizedBox(width: 4),
+                    Text(
+                      'закреплено',
+                      style: TextStyle(
+                        color: VColors.yellow,
+                        fontSize: 10,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             if (msg.edited)
               const Padding(
                 padding: EdgeInsets.only(left: 8, top: 2),

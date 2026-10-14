@@ -18,6 +18,8 @@ class Storage:
         self.users: Dict[str, dict] = {}
         self.pending: Dict[str, dict] = {}
         self.groups: Dict[str, dict] = {}
+        # group_id -> [ {message_id, pinned_at, pinned_by} ]
+        self.pins: Dict[str, list] = {}
         self.messages: List[dict] = []
         self.admin_uuid: Optional[str] = None
         self._ensure_dirs()
@@ -45,6 +47,10 @@ class Storage:
         if os.path.exists(config.GROUPS_FILE):
             async with aiofiles.open(config.GROUPS_FILE, "r", encoding="utf-8") as f:
                 self.groups = json.loads(await f.read())
+        if os.path.exists(config.PINS_FILE):
+            async with aiofiles.open(config.PINS_FILE, "r", encoding="utf-8") as f:
+                raw = json.loads(await f.read())
+                self.pins = {str(k): list(v) for k, v in (raw or {}).items()}
         if os.path.exists(config.ADMIN_UUID_FILE):
             async with aiofiles.open(config.ADMIN_UUID_FILE, "r", encoding="utf-8") as f:
                 self.admin_uuid = (await f.read()).strip() or None
@@ -92,6 +98,87 @@ class Storage:
     async def save_pending(self):
         async with aiofiles.open(config.PENDING_FILE, "w", encoding="utf-8") as f:
             await f.write(json.dumps(self.pending, ensure_ascii=False, indent=2))
+
+    
+    async def save_pins(self):
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        async with aiofiles.open(config.PINS_FILE, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(self.pins, ensure_ascii=False, indent=2))
+
+    def pinned_ids(self, group_id: str) -> set:
+        return {p.get("message_id") for p in self.pins.get(group_id, []) if p.get("message_id")}
+
+    def is_pinned(self, message_id: str, group_id: str | None = None) -> bool:
+        if group_id:
+            return any(p.get("message_id") == message_id for p in self.pins.get(group_id, []))
+        for lst in self.pins.values():
+            if any(p.get("message_id") == message_id for p in lst):
+                return True
+        return False
+
+    def pins_for_group(self, group_id: str) -> list:
+        """Список закрепов с телом сообщения (если ещё есть)."""
+        out = []
+        for p in self.pins.get(group_id, []):
+            mid = p.get("message_id")
+            msg = next((m for m in self.messages if m.get("id") == mid), None)
+            entry = {
+                "message_id": mid,
+                "pinned_at": p.get("pinned_at"),
+                "pinned_by": p.get("pinned_by"),
+            }
+            if msg:
+                entry["message"] = msg
+            out.append(entry)
+        return out
+
+    async def pin_message(self, message_id: str, by_uuid: str, group_id=None):
+        """Returns (ok, error_or_None, group_id)."""
+        msg = next((m for m in self.messages if m.get("id") == message_id), None)
+        if not msg:
+            return False, "message not found", None
+        gid = group_id or msg.get("group_id") or config.GLOBAL_GROUP_ID
+        if msg.get("msg_type") in ("system", "date"):
+            return False, "cannot pin system message", gid
+        lst = self.pins.setdefault(gid, [])
+        if any(p.get("message_id") == message_id for p in lst):
+            return True, None, gid  # already
+        limit = config.MAX_PINS_GLOBAL if gid == config.GLOBAL_GROUP_ID else config.MAX_PINS_GROUP
+        if len(lst) >= limit:
+            return False, f"pin limit ({limit})", gid
+        now = int(time.time() * 1000)
+        lst.append({
+            "message_id": message_id,
+            "pinned_at": now,
+            "pinned_by": by_uuid,
+        })
+        msg["pinned"] = True
+        msg["pinned_at"] = now
+        await self.save_pins()
+        await self._rewrite_message_files()
+        return True, None, gid
+
+    async def unpin_message(self, message_id: str, group_id=None):
+        gid = group_id
+        if not gid:
+            for g, lst in self.pins.items():
+                if any(p.get("message_id") == message_id for p in lst):
+                    gid = g
+                    break
+        if not gid:
+            return False, "not pinned", None
+        lst = self.pins.get(gid, [])
+        new_lst = [p for p in lst if p.get("message_id") != message_id]
+        if len(new_lst) == len(lst):
+            return False, "not pinned", gid
+        self.pins[gid] = new_lst
+        msg = next((m for m in self.messages if m.get("id") == message_id), None)
+        if msg:
+            msg.pop("pinned", None)
+            msg.pop("pinned_at", None)
+            await self._rewrite_message_files()
+        await self.save_pins()
+        return True, None, gid
 
     async def save_groups(self):
         async with aiofiles.open(config.GROUPS_FILE, "w", encoding="utf-8") as f:
@@ -504,40 +591,85 @@ class Storage:
         msg_cutoff = now - config.MESSAGE_RETENTION_HOURS * 3600 * 1000
         file_cutoff = now - config.FILE_PHOTO_RETENTION_HOURS * 3600 * 1000
         video_cutoff = now - config.VIDEO_RETENTION_HOURS * 3600 * 1000
+        pin_cutoff = now - config.PINNED_RETENTION_HOURS * 3600 * 1000
+
+        # снять просроченные закрепы (> 30 дней с момента pin)
+        pins_changed = False
+        for gid, lst in list(self.pins.items()):
+            fresh = []
+            for p in lst:
+                pat = p.get("pinned_at") or 0
+                if pat >= pin_cutoff:
+                    fresh.append(p)
+                else:
+                    pins_changed = True
+                    mid = p.get("message_id")
+                    msg = next((m for m in self.messages if m.get("id") == mid), None)
+                    if msg:
+                        msg.pop("pinned", None)
+                        msg.pop("pinned_at", None)
+            self.pins[gid] = fresh
+        if pins_changed:
+            await self.save_pins()
+
+        pinned_alive = set()
+        for lst in self.pins.values():
+            for p in lst:
+                if p.get("message_id"):
+                    pinned_alive.add(p["message_id"])
 
         keep = []
         for m in self.messages:
+            mid = m.get("id")
+            # закреплённые живут, пока пин актуален (до 30 дней)
+            if mid in pinned_alive:
+                keep.append(m)
+                continue
             mtype = m.get("msg_type", "text")
             ts = m.get("ts", 0)
-            if mtype in ("text", "system") and ts < msg_cutoff:
+            if mtype in ("text", "system", "date") and ts < msg_cutoff:
                 continue
             if mtype in ("file", "photo") and ts < file_cutoff:
-                mid = m.get("media_id")
-                if mid:
-                    for p in Path(config.MEDIA_DIR).glob(f"{mid}*"):
+                media = m.get("media_id")
+                if media:
+                    for pp in Path(config.MEDIA_DIR).glob(f"{media}*"):
                         try:
-                            p.unlink()
+                            pp.unlink()
                         except OSError:
                             pass
                 continue
             if mtype == "video" and ts < video_cutoff:
-                mid = m.get("media_id")
-                if mid:
-                    for p in Path(config.MEDIA_DIR).glob(f"{mid}*"):
+                media = m.get("media_id")
+                if media:
+                    for pp in Path(config.MEDIA_DIR).glob(f"{media}*"):
                         try:
-                            p.unlink()
+                            pp.unlink()
                         except OSError:
                             pass
                 continue
             keep.append(m)
         self.messages = keep
 
+        # jsonl: не трогаем дни, где ещё есть закреплённые
+        pinned_days = set()
+        for m in self.messages:
+            if m.get("id") in pinned_alive:
+                ts = m.get("ts") or 0
+                try:
+                    pinned_days.add(
+                        datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+                    )
+                except (OSError, ValueError, OverflowError):
+                    pass
+
         cutoff_date = datetime.now() - timedelta(days=8)
-        for p in Path(config.MESSAGES_DIR).glob("*.jsonl"):
+        for pp in Path(config.MESSAGES_DIR).glob("*.jsonl"):
             try:
-                file_date = datetime.strptime(p.stem, "%Y-%m-%d")
+                if pp.stem in pinned_days:
+                    continue
+                file_date = datetime.strptime(pp.stem, "%Y-%m-%d")
                 if file_date < cutoff_date:
-                    p.unlink()
+                    pp.unlink()
             except ValueError:
                 pass
-        print(f"[cleanup] done, kept {len(self.messages)} messages")
+        print(f"[cleanup] done, kept {len(self.messages)} messages, pins={sum(len(v) for v in self.pins.values())}")

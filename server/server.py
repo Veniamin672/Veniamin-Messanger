@@ -13,6 +13,8 @@ import traceback
 from pathlib import Path
 from typing import Dict, Optional
 
+import ssl
+from pathlib import Path as _Path
 import websockets
 from websockets.asyncio.server import serve, ServerConnection
 
@@ -42,8 +44,10 @@ class VeniaminServer:
         self.storage = Storage()
         self.clients: Dict[str, Client] = {}
         self.connections: Dict[ServerConnection, Client] = {}
-        # account_id -> {"peer": account_id, "call_id": str}
+        # account_id -> {"call_id": str}
         self.active_calls: Dict[str, dict] = {}
+        # call_id -> set(account_id)
+        self.call_rooms: Dict[str, set] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
         self._date_sep_task: Optional[asyncio.Task] = None
 
@@ -59,6 +63,25 @@ class VeniaminServer:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._date_sep_task = asyncio.create_task(self._date_separator_loop())
 
+        ssl_ctx = None
+        scheme = "ws"
+        if getattr(config, "USE_TLS", False):
+            cert = _Path(config.SSL_CERTFILE)
+            key = _Path(config.SSL_KEYFILE)
+            if not cert.is_file() or not key.is_file():
+                raise SystemExit(
+                    "[Veniamin] USE_TLS=True, но нет сертификатов.\n"
+                    f"  ожидал: {cert.resolve()} и {key.resolve()}\n"
+                    "  Сгенерируйте:  python generate_certs.py\n"
+                    "  Или отключите TLS: USE_TLS = False в config.py"
+                )
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(str(cert), str(key))
+            scheme = "wss"
+            print(f"[Veniamin] TLS ON  cert={cert}")
+        else:
+            print("[Veniamin] TLS OFF  (ws:// без шифрования канала)")
+
         async with serve(
             self.handler,
             config.HOST,
@@ -66,8 +89,9 @@ class VeniaminServer:
             max_size=config.MAX_FILE_SIZE + 512 * 1024,
             ping_interval=20,
             ping_timeout=30,
+            ssl=ssl_ctx,
         ):
-            print(f"[Veniamin] ws://{config.HOST}:{config.PORT}")
+            print(f"[Veniamin] {scheme}://{config.HOST}:{config.PORT}")
             await asyncio.Future()
 
     async def _cleanup_loop(self):
@@ -286,6 +310,9 @@ class VeniaminServer:
             PacketType.MESSAGE: self.handle_message,
             PacketType.DELETE_MESSAGE: self.handle_delete_message,
             PacketType.EDIT_MESSAGE: self.handle_edit_message,
+            PacketType.PIN_MESSAGE: self.handle_pin_message,
+            PacketType.UNPIN_MESSAGE: self.handle_unpin_message,
+            PacketType.GET_PINS: self.handle_get_pins,
             PacketType.FILE: self.handle_file,
             PacketType.GET_MEDIA: self.handle_get_media,
             PacketType.GET_HISTORY: self.handle_get_history,
@@ -413,6 +440,43 @@ class VeniaminServer:
             pending=list(self.storage.pending.values()),
         ))
 
+
+    async def handle_typing(self, client: Client, packet: dict):
+        if not client.authenticated:
+            return
+        group_id = packet.get("group_id") or config.GLOBAL_GROUP_ID
+        is_typing = bool(packet.get("is_typing", True))
+        await self.broadcast(
+            make_packet(
+                PacketType.TYPING_BROADCAST,
+                uuid=client.account_id or client.uuid,
+                display_name=client.display_name,
+                group_id=group_id,
+                is_typing=is_typing,
+            ),
+            exclude=client.uuid,
+            group_id=group_id,
+        )
+
+    async def handle_read(self, client: Client, packet: dict):
+        if not client.authenticated:
+            return
+        message_id = packet.get("message_id")
+        group_id = packet.get("group_id") or config.GLOBAL_GROUP_ID
+        if not message_id:
+            return
+        await self.broadcast(
+            make_packet(
+                PacketType.READ_RECEIPT,
+                message_id=message_id,
+                uuid=client.account_id or client.uuid,
+                display_name=client.display_name,
+                group_id=group_id,
+            ),
+            exclude=client.uuid,
+            group_id=group_id,
+        )
+
     async def handle_ping(self, client: Client, packet: dict):
         await self.send(client.ws, make_packet(PacketType.PONG))
 
@@ -445,6 +509,67 @@ class VeniaminServer:
         )
         print(f"[{_now()}] [edit] {client.display_name} правил {str(message_id)[:8]}…")
 
+
+    async def _send_pins(self, group_id: str, to_ws=None):
+        packet = make_packet(
+            PacketType.PINS_UPDATED,
+            group_id=group_id,
+            pins=self.storage.pins_for_group(group_id),
+            max_pins=(
+                config.MAX_PINS_GLOBAL
+                if group_id == config.GLOBAL_GROUP_ID
+                else config.MAX_PINS_GROUP
+            ),
+        )
+        if to_ws is not None:
+            await self.send(to_ws, packet)
+        else:
+            await self.broadcast(packet, group_id=group_id)
+
+    async def handle_pin_message(self, client: Client, packet: dict):
+        if not client.authenticated:
+            return
+        message_id = packet.get("message_id") or packet.get("id")
+        group_id = packet.get("group_id")
+        if not message_id:
+            return
+        msg = next((m for m in self.storage.messages if m.get("id") == message_id), None)
+        gid = group_id or (msg or {}).get("group_id") or config.GLOBAL_GROUP_ID
+        if not self._in_group(client.uuid, gid):
+            await self.send(client.ws, make_packet(PacketType.ERROR, message="Not in group"))
+            return
+        ok, err, gid = await self.storage.pin_message(message_id, client.uuid, gid)
+        if not ok:
+            await self.send(
+                client.ws, make_packet(PacketType.ERROR, message=err or "pin failed")
+            )
+            return
+        print(f"[{_now()}] [pin] {client.display_name} → {str(message_id)[:8]}… in {gid}")
+        await self._send_pins(gid)
+
+    async def handle_unpin_message(self, client: Client, packet: dict):
+        if not client.authenticated:
+            return
+        message_id = packet.get("message_id") or packet.get("id")
+        group_id = packet.get("group_id")
+        if not message_id:
+            return
+        ok, err, gid = await self.storage.unpin_message(message_id, group_id)
+        if not ok:
+            await self.send(
+                client.ws, make_packet(PacketType.ERROR, message=err or "unpin failed")
+            )
+            return
+        print(f"[{_now()}] [unpin] {client.display_name} → {str(message_id)[:8]}…")
+        if gid:
+            await self._send_pins(gid)
+
+    async def handle_get_pins(self, client: Client, packet: dict):
+        if not client.authenticated:
+            return
+        group_id = packet.get("group_id") or config.GLOBAL_GROUP_ID
+        await self._send_pins(group_id, to_ws=client.ws)
+
     async def handle_delete_message(self, client: Client, packet: dict):
         if not client.authenticated:
             return
@@ -458,6 +583,9 @@ class VeniaminServer:
             ))
             return
         group_id = msg.get("group_id") or config.GLOBAL_GROUP_ID
+        ok_unpin, _, gid = await self.storage.unpin_message(message_id, group_id)
+        if ok_unpin and gid:
+            await self._send_pins(gid)
         await self.broadcast(
             make_packet(
                 PacketType.MESSAGE_DELETED,
@@ -863,46 +991,73 @@ class VeniaminServer:
         ab = ub.get("account_id") or device_b
         return aa == ab
 
+
     def _call_account(self, device_or_account: str) -> str:
         return self.storage.account_id_of(device_or_account) or device_or_account
+
+    def _room_accounts(self, call_id: str) -> set:
+        return set(self.call_rooms.get(call_id) or set())
+
+    def _join_room(self, call_id: str, *accounts: str):
+        room = self.call_rooms.setdefault(call_id, set())
+        for a in accounts:
+            if not a:
+                continue
+            room.add(a)
+            self.active_calls[a] = {"call_id": call_id}
+
+    def _leave_room(self, account: str, call_id=None):
+        info = self.active_calls.pop(account, None)
+        cid = call_id or (info or {}).get("call_id")
+        if not cid:
+            return None
+        room = self.call_rooms.get(cid)
+        if room is not None:
+            room.discard(account)
+            if not room:
+                self.call_rooms.pop(cid, None)
+        return cid
 
     def _clear_call_accounts(self, *accounts: str):
         for a in accounts:
             if not a:
                 continue
-            info = self.active_calls.pop(a, None)
-            if info and info.get("peer"):
-                self.active_calls.pop(info["peer"], None)
+            self._leave_room(a)
+
+    async def _broadcast_call_room(self, call_id: str, packet: dict, exclude=None):
+        exclude = exclude or set()
+        for acc in list(self._room_accounts(call_id)):
+            if acc in exclude:
+                continue
+            for du in self._resolve_online_devices(acc):
+                c = self.clients.get(du)
+                if c and c.ws:
+                    await self.send(c.ws, packet)
 
     async def handle_call_relay(self, client: Client, packet: dict):
         if not client.authenticated:
             return
         target = packet.get("to_uuid")
-        if not target:
-            return
         ptype = packet["type"]
         caller_acc = self._call_account(client.account_id or client.uuid)
-        target_acc = self._call_account(target)
-        call_id = packet.get("call_id")
+        call_id = packet.get("call_id") or ""
+        target_acc = self._call_account(target) if target else ""
 
-        # исходящий звонок — проверка «линия занята»
-        if ptype == PacketType.CALL_OFFER:
+        # --- offer / invite: start or add to mesh ---
+        if ptype in (PacketType.CALL_OFFER, PacketType.CALL_INVITE):
+            if not target:
+                return
             if self._same_account(client.uuid, target):
                 await self.send(client.ws, make_packet(
                     PacketType.ERROR, message="нельзя позвонить самому себе"
                 ))
                 return
-            busy = False
-            if target_acc in self.active_calls:
-                busy = True
-            if caller_acc in self.active_calls:
-                busy = True
-            # любой онлайн-девайс цели уже в звонке
-            for tuid in self._resolve_online_devices(target):
-                tacc = self._call_account(tuid)
-                if tacc in self.active_calls:
-                    busy = True
-            if busy:
+
+            caller_info = self.active_calls.get(caller_acc)
+            target_info = self.active_calls.get(target_acc)
+
+            # занят другим звонком
+            if target_info and target_info.get("call_id") != call_id:
                 await self.send(client.ws, make_packet(
                     PacketType.CALL_BUSY,
                     to_uuid=target,
@@ -911,81 +1066,169 @@ class VeniaminServer:
                 ))
                 print(f"[{_now()}] [call] busy {client.display_name} → {target_acc[:8]}…")
                 return
-            targets = [
-                tuid for tuid in self._resolve_online_devices(target)
-                if not self._same_account(client.uuid, tuid)
-            ]
-            if not targets:
+            if caller_info and call_id and caller_info.get("call_id") != call_id:
                 await self.send(client.ws, make_packet(
-                    PacketType.CALL_BUSY,
-                    to_uuid=target,
-                    call_id=call_id,
-                    message="Абонент недоступен",
+                    PacketType.ERROR, message="вы уже в другом звонке"
                 ))
                 return
-            # резервируем линию (звонок / гудки)
-            self.active_calls[caller_acc] = {"peer": target_acc, "call_id": call_id}
-            self.active_calls[target_acc] = {"peer": caller_acc, "call_id": call_id}
-            out = make_packet(
-                PacketType.CALL_INCOMING,
-                from_uuid=client.uuid,
-                from_name=client.display_name,
-                from_account=client.account_id or client.uuid,
-                to_uuid=target,
-                sdp=packet.get("sdp"),
-                candidate=packet.get("candidate"),
-                call_id=call_id,
-            )
+
+            # зарегистрировать комнату для звонящего
+            if call_id:
+                self._join_room(call_id, caller_acc)
+
+            targets = self._resolve_online_devices(target)
+            if not targets:
+                await self.send(client.ws, make_packet(
+                    PacketType.ERROR, message="абонент не в сети"
+                ))
+                return
+
+            participants = [
+                {
+                    "uuid": a,
+                    "display_name": self._display_name_for_account(a),
+                }
+                for a in self._room_accounts(call_id)
+            ]
             for tuid in targets:
-                await self.send_to(tuid, out)
+                c = self.clients.get(tuid)
+                if not c:
+                    continue
+                await self.send(
+                    c.ws,
+                    make_packet(
+                        PacketType.CALL_INCOMING,
+                        from_uuid=client.account_id or client.uuid,
+                        from_name=client.display_name,
+                        call_id=call_id,
+                        sdp=packet.get("sdp"),
+                        participants=participants,
+                        is_group=len(participants) > 1,
+                    ),
+                )
+            print(
+                f"[{_now()}] [call] offer {client.display_name} → {target_acc[:8]}… "
+                f"room={len(self._room_accounts(call_id))}"
+            )
             return
 
+        # --- answer ---
+        if ptype == PacketType.CALL_ANSWER:
+            if not target:
+                return
+            if call_id:
+                self._join_room(call_id, caller_acc, target_acc)
+            # relay answer to original offerer
+            for tuid in self._resolve_online_devices(target):
+                c = self.clients.get(tuid)
+                if c:
+                    await self.send(
+                        c.ws,
+                        make_packet(
+                            PacketType.CALL_ANSWERED,
+                            from_uuid=client.account_id or client.uuid,
+                            from_name=client.display_name,
+                            call_id=call_id,
+                            sdp=packet.get("sdp"),
+                        ),
+                    )
+            # notify room about new participant
+            if call_id:
+                await self._broadcast_call_room(
+                    call_id,
+                    make_packet(
+                        PacketType.CALL_PEER_JOINED,
+                        call_id=call_id,
+                        uuid=client.account_id or client.uuid,
+                        display_name=client.display_name,
+                        participants=[
+                            {
+                                "uuid": a,
+                                "display_name": self._display_name_for_account(a),
+                            }
+                            for a in self._room_accounts(call_id)
+                        ],
+                    ),
+                    exclude={caller_acc},
+                )
+            print(f"[{_now()}] [call] answer {client.display_name}")
+            return
+
+        # --- ICE ---
+        if ptype == PacketType.CALL_ICE:
+            if not target:
+                return
+            for tuid in self._resolve_online_devices(target):
+                c = self.clients.get(tuid)
+                if c:
+                    await self.send(
+                        c.ws,
+                        make_packet(
+                            PacketType.CALL_ICE_CANDIDATE,
+                            from_uuid=client.account_id or client.uuid,
+                            call_id=call_id,
+                            candidate=packet.get("candidate"),
+                        ),
+                    )
+            return
+
+        # --- hangup / reject ---
         if ptype in (PacketType.CALL_HANGUP, PacketType.CALL_REJECT):
-            self._clear_call_accounts(caller_acc, target_acc)
-
-        mapping = {
-            PacketType.CALL_ANSWER: PacketType.CALL_ANSWERED,
-            PacketType.CALL_ICE: PacketType.CALL_ICE_CANDIDATE,
-            PacketType.CALL_HANGUP: PacketType.CALL_ENDED,
-            PacketType.CALL_REJECT: PacketType.CALL_ENDED,
-        }
-        out_type = mapping.get(ptype, ptype)
-        out = make_packet(
-            out_type,
-            from_uuid=client.uuid,
-            from_name=client.display_name,
-            from_account=client.account_id or client.uuid,
-            to_uuid=target,
-            sdp=packet.get("sdp"),
-            candidate=packet.get("candidate"),
-            call_id=call_id,
-        )
-        targets = self._resolve_online_devices(target)
-        for tuid in targets:
-            if self._same_account(client.uuid, tuid):
-                continue
-            await self.send_to(tuid, out)
-
-    async def handle_typing(self, client: Client, packet: dict):
-        if not client.authenticated:
+            cid = call_id or (self.active_calls.get(caller_acc) or {}).get("call_id")
+            room_before = list(self._room_accounts(cid)) if cid else []
+            left_cid = self._leave_room(caller_acc, cid)
+            # notify specific target if set
+            if target:
+                for tuid in self._resolve_online_devices(target):
+                    c = self.clients.get(tuid)
+                    if c:
+                        await self.send(
+                            c.ws,
+                            make_packet(
+                                PacketType.CALL_PEER_LEFT,
+                                from_uuid=client.account_id or client.uuid,
+                                from_name=client.display_name,
+                                call_id=left_cid or call_id,
+                            ),
+                        )
+            if left_cid:
+                await self._broadcast_call_room(
+                    left_cid,
+                    make_packet(
+                        PacketType.CALL_PEER_LEFT,
+                        from_uuid=client.account_id or client.uuid,
+                        from_name=client.display_name,
+                        call_id=left_cid,
+                    ),
+                )
+                # if only one remains, end their call
+                remaining = self._room_accounts(left_cid)
+                if len(remaining) <= 1:
+                    for acc in list(remaining):
+                        self._leave_room(acc, left_cid)
+                        for tuid in self._resolve_online_devices(acc):
+                            c = self.clients.get(tuid)
+                            if c:
+                                await self.send(
+                                    c.ws,
+                                    make_packet(
+                                        PacketType.CALL_ENDED,
+                                        call_id=left_cid,
+                                        reason="peer left",
+                                    ),
+                                )
+            print(f"[{_now()}] [call] hangup {client.display_name}")
             return
-        group_id = packet.get("group_id") or config.GLOBAL_GROUP_ID
-        await self.broadcast(make_packet(
-            PacketType.TYPING_BROADCAST,
-            uuid=client.uuid,
-            display_name=client.display_name,
-            group_id=group_id,
-            is_typing=packet.get("is_typing", True),
-        ), exclude=client.uuid, group_id=group_id)
 
-    async def handle_read(self, client: Client, packet: dict):
-        if not client.authenticated:
-            return
-        await self.broadcast(make_packet(
-            PacketType.READ_RECEIPT,
-            uuid=client.uuid,
-            message_id=packet.get("message_id"),
-        ), exclude=client.uuid)
+    def _display_name_for_account(self, account_id: str) -> str:
+        for u in self.storage.users.values():
+            if u.get("account_id") == account_id or u.get("uuid") == account_id:
+                return u.get("display_name") or account_id[:8]
+        for c in self.clients.values():
+            if (c.account_id or c.uuid) == account_id:
+                return c.display_name or account_id[:8]
+        return account_id[:8] if account_id else "?"
+
 
     async def disconnect(self, client: Client):
         self.clients.pop(client.uuid, None)
@@ -993,17 +1236,34 @@ class VeniaminServer:
         if client.authenticated:
             acc = self._call_account(client.account_id or client.uuid)
             if acc in self.active_calls:
-                peer = (self.active_calls.get(acc) or {}).get("peer")
-                self._clear_call_accounts(acc)
-                # уведомить собеседника, что звонок оборвался
-                if peer:
-                    for tuid in self._resolve_online_devices(peer):
-                        await self.send_to(tuid, make_packet(
-                            PacketType.CALL_ENDED,
-                            from_uuid=client.uuid,
+                cid = (self.active_calls.get(acc) or {}).get("call_id")
+                left = self._leave_room(acc, cid)
+                if left:
+                    await self._broadcast_call_room(
+                        left,
+                        make_packet(
+                            PacketType.CALL_PEER_LEFT,
+                            from_uuid=client.account_id or client.uuid,
                             from_name=client.display_name,
+                            call_id=left,
                             reason="disconnect",
-                        ))
+                        ),
+                    )
+                    remaining = self._room_accounts(left)
+                    if len(remaining) <= 1:
+                        for a in list(remaining):
+                            self._leave_room(a, left)
+                            for tuid in self._resolve_online_devices(a):
+                                c = self.clients.get(tuid)
+                                if c:
+                                    await self.send(
+                                        c.ws,
+                                        make_packet(
+                                            PacketType.CALL_ENDED,
+                                            call_id=left,
+                                            reason="disconnect",
+                                        ),
+                                    )
             await self.broadcast(make_packet(
                 PacketType.USER_LEFT,
                 uuid=client.uuid,

@@ -20,6 +20,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
   final _formKey = GlobalKey<FormState>();
   List<KnownAccount> _known = [];
   String? _selectedKnownId;
+  bool _useTls = true;
 
   @override
   void initState() {
@@ -44,6 +45,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
       if (DeviceId.lastServerPort != null) {
         _portCtrl.text = '${DeviceId.lastServerPort}';
       }
+      _useTls = DeviceId.lastUseTls;
       if (_nameCtrl.text.isEmpty &&
           DeviceId.lastDisplayName != null &&
           DeviceId.lastDisplayName!.isNotEmpty) {
@@ -96,6 +98,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
       port: port,
       name: _nameCtrl.text,
       accountId: aid.isEmpty ? null : aid,
+      useTls: _useTls,
     );
   }
 
@@ -172,6 +175,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                       const SizedBox(height: 20),
+                      const _SectionDivider(title: 'Устройство'),
                       _InfoLine(
                         label: 'device_uuid',
                         value: DeviceId.uuid,
@@ -185,19 +189,10 @@ class _ConnectScreenState extends State<ConnectScreen> {
                           copyable: true,
                         ),
                       ],
-                      const SizedBox(height: 16),
 
                       // Known accounts switcher
                       if (_known.isNotEmpty) ...[
-                        const Text(
-                          'СМЕНА АККАУНТА',
-                          style: TextStyle(
-                            color: VColors.dim,
-                            fontSize: 11,
-                            letterSpacing: 1.2,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
+                        const _SectionDivider(title: 'Аккаунты'),
                         ..._known.map((a) {
                           final selected = a.id == _selectedKnownId;
                           return Padding(
@@ -287,9 +282,10 @@ class _ConnectScreenState extends State<ConnectScreen> {
                             foregroundColor: VColors.blue,
                           ),
                         ),
-                        const SizedBox(height: 12),
+                        const SizedBox(height: 4),
                       ],
 
+                      const _SectionDivider(title: 'Параметры сервера'),
                       Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -347,7 +343,27 @@ class _ConnectScreenState extends State<ConnectScreen> {
                           return null;
                         },
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 4),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(
+                          'WSS (TLS)',
+                          style: TextStyle(fontSize: 14),
+                        ),
+                        subtitle: Text(
+                          _useTls
+                              ? 'шифрованный канал wss://'
+                              : 'без шифрования ws://',
+                          style: const TextStyle(
+                              fontSize: 11, color: VColors.dim),
+                        ),
+                        value: _useTls,
+                        activeColor: VColors.green,
+                        onChanged: isBusy
+                            ? null
+                            : (v) => setState(() => _useTls = v),
+                      ),
+                      const _SectionDivider(title: 'Параметры аккаунта'),
                       TextFormField(
                         controller: _nameCtrl,
                         enabled: !isBusy,
@@ -434,6 +450,46 @@ class _ConnectScreenState extends State<ConnectScreen> {
             );
           },
         ),
+      ),
+    );
+  }
+}
+
+
+class _SectionDivider extends StatelessWidget {
+  final String title;
+  const _SectionDivider({required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16, bottom: 12),
+      child: Row(
+        children: [
+          const Expanded(
+            child: Divider(
+              color: VColors.border,
+              thickness: 1,
+              endIndent: 12,
+            ),
+          ),
+          Text(
+            title.toUpperCase(),
+            style: const TextStyle(
+              color: VColors.dim,
+              fontSize: 11,
+              letterSpacing: 1.4,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const Expanded(
+            child: Divider(
+              color: VColors.border,
+              thickness: 1,
+              indent: 12,
+            ),
+          ),
+        ],
       ),
     );
   }

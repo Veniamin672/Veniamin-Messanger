@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/io.dart';
 import 'device_id.dart';
 import 'notifications.dart';
 
@@ -61,6 +62,8 @@ class ChatMessage {
   final MessageReply? replyTo;
   final bool edited;
   final int? editedTs;
+  final bool pinned;
+  final int? pinnedAt;
 
   ChatMessage({
     required this.id,
@@ -77,12 +80,16 @@ class ChatMessage {
     this.replyTo,
     this.edited = false,
     this.editedTs,
+    this.pinned = false,
+    this.pinnedAt,
   });
 
   ChatMessage copyWith({
     String? text,
     bool? edited,
     int? editedTs,
+    bool? pinned,
+    int? pinnedAt,
   }) =>
       ChatMessage(
         id: id,
@@ -99,6 +106,8 @@ class ChatMessage {
         replyTo: replyTo,
         edited: edited ?? this.edited,
         editedTs: editedTs ?? this.editedTs,
+        pinned: pinned ?? this.pinned,
+        pinnedAt: pinnedAt ?? this.pinnedAt,
       );
 
   factory ChatMessage.fromJson(Map<String, dynamic> j) {
@@ -122,6 +131,8 @@ class ChatMessage {
       replyTo: reply,
       edited: j['edited'] == true,
       editedTs: j['edited_ts'],
+      pinned: j['pinned'] == true,
+      pinnedAt: j['pinned_at'],
     );
   }
 }
@@ -208,6 +219,46 @@ class GroupInfo {
   }
 }
 
+class PinnedEntry {
+  final String messageId;
+  final int? pinnedAt;
+  final String? pinnedBy;
+  final ChatMessage? message;
+
+  PinnedEntry({
+    required this.messageId,
+    this.pinnedAt,
+    this.pinnedBy,
+    this.message,
+  });
+
+  factory PinnedEntry.fromJson(Map<String, dynamic> j) {
+    ChatMessage? msg;
+    final raw = j['message'];
+    if (raw is Map) {
+      msg = ChatMessage.fromJson(Map<String, dynamic>.from(raw));
+    }
+    return PinnedEntry(
+      messageId: j['message_id']?.toString() ?? '',
+      pinnedAt: j['pinned_at'] as int?,
+      pinnedBy: j['pinned_by']?.toString(),
+      message: msg,
+    );
+  }
+
+  String get preview {
+    final m = message;
+    if (m == null) return 'Сообщение';
+    if (m.msgType == 'text') {
+      final t = m.text ?? '';
+      return t.length > 80 ? '${t.substring(0, 80)}…' : t;
+    }
+    return m.filename ?? m.msgType;
+  }
+
+  String get fromName => message?.fromName ?? '';
+}
+
 class ConnectionService extends ChangeNotifier {
   WebSocketChannel? _channel;
   int _sessionEpoch = 0;
@@ -219,6 +270,7 @@ class ConnectionService extends ChangeNotifier {
   String? errorMessage;
   String? serverHost;
   int serverPort = 8765;
+  bool useTls = true;
   String displayName = '';
   bool isAdmin = false;
   UserInfo? me;
@@ -227,6 +279,8 @@ class ConnectionService extends ChangeNotifier {
   List<GroupInfo> groups = [];
   String currentGroupId = 'global';
   List<ChatMessage> messages = [];
+  List<PinnedEntry> pins = [];
+  int maxPins = 20;
   String? typingUser;
 
   // Media download callbacks
@@ -258,7 +312,10 @@ class ConnectionService extends ChangeNotifier {
   }
 
   Future<void> connect(String host,
-      {int port = 8765, required String name, String? accountId}) async {
+      {int port = 8765,
+      required String name,
+      String? accountId,
+      bool useTls = true}) async {
     if (state == ConnState.connecting) {
       return;
     }
@@ -276,6 +333,7 @@ class ConnectionService extends ChangeNotifier {
 
     serverHost = host.trim();
     serverPort = port;
+    this.useTls = useTls;
     displayName = name.trim().isEmpty ? 'Anonymous' : name.trim();
     if (accountId != null && accountId.isNotEmpty) {
       await DeviceId.saveAccountId(accountId);
@@ -285,8 +343,18 @@ class ConnectionService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final uri = Uri.parse('ws://$serverHost:$serverPort');
-      _channel = WebSocketChannel.connect(uri);
+      final scheme = this.useTls ? 'wss' : 'ws';
+      final uri = Uri.parse('$scheme://$serverHost:$serverPort');
+      if (this.useTls) {
+        // Self-signed certs in LAN: accept for private messenger.
+        // For production put a real CA cert on the server and tighten this.
+        final httpClient = HttpClient()
+          ..badCertificateCallback =
+              (X509Certificate cert, String host, int port) => true;
+        _channel = IOWebSocketChannel.connect(uri, customClient: httpClient);
+      } else {
+        _channel = IOWebSocketChannel.connect(uri);
+      }
       await _channel!.ready;
 
       _sub = _channel!.stream.listen(
@@ -360,6 +428,7 @@ class ConnectionService extends ChangeNotifier {
   void selectGroup(String groupId) {
     currentGroupId = groupId;
     VeniaminNotifications.activeGroupId = groupId;
+    pins = [];
     getHistory(groupId: groupId);
     notifyListeners();
   }
@@ -387,6 +456,28 @@ class ConnectionService extends ChangeNotifier {
     // оптимистично убираем у себя
     messages.removeWhere((m) => m.id == messageId);
     notifyListeners();
+  }
+
+  void pinMessage(String messageId) {
+    if (messageId.isEmpty) return;
+    _send({
+      'type': 'pin_message',
+      'message_id': messageId,
+      'group_id': currentGroupId,
+    });
+  }
+
+  void unpinMessage(String messageId) {
+    if (messageId.isEmpty) return;
+    _send({
+      'type': 'unpin_message',
+      'message_id': messageId,
+      'group_id': currentGroupId,
+    });
+  }
+
+  void requestPins() {
+    _send({'type': 'get_pins', 'group_id': currentGroupId});
   }
 
   void editMessage(String messageId, String newText) {
@@ -561,12 +652,13 @@ class ConnectionService extends ChangeNotifier {
   }
 
   void hangup() {
-    if (callPeerUuid != null && activeCallId != null) {
-      _send({
+    if (activeCallId != null) {
+      final pkt = <String, dynamic>{
         'type': 'call_hangup',
-        'to_uuid': callPeerUuid,
         'call_id': activeCallId,
-      });
+      };
+      if (callPeerUuid != null) pkt['to_uuid'] = callPeerUuid;
+      _send(pkt);
     }
     _clearCall();
   }
@@ -650,6 +742,7 @@ class ConnectionService extends ChangeNotifier {
               host: host,
               port: serverPort,
               name: displayName,
+              useTls: useTls,
             );
           }
           _userDisconnected = false;
@@ -703,6 +796,29 @@ class ConnectionService extends ChangeNotifier {
           errorMessage = 'Access denied by admin';
           notifyListeners();
           disconnect();
+          break;
+
+        case 'pins_updated':
+          if (packet['group_id']?.toString() == currentGroupId ||
+              packet['group_id'] == null) {
+            final raw = packet['pins'];
+            if (raw is List) {
+              pins = raw
+                  .whereType<Map>()
+                  .map((e) => PinnedEntry.fromJson(Map<String, dynamic>.from(e)))
+                  .toList();
+            } else {
+              pins = [];
+            }
+            final mx = packet['max_pins'];
+            if (mx is int) maxPins = mx;
+            // sync pinned flag on messages
+            final ids = pins.map((p) => p.messageId).toSet();
+            messages = messages
+                .map((m) => m.copyWith(pinned: ids.contains(m.id)))
+                .toList();
+            notifyListeners();
+          }
           break;
 
         case 'message_edited':
@@ -857,6 +973,11 @@ class ConnectionService extends ChangeNotifier {
           notifyListeners();
           break;
 
+        case 'call_peer_joined':
+        case 'call_peer_left':
+          onCallSignal?.call(packet);
+          break;
+
         case 'call_ended':
           _clearCall();
           onCallSignal?.call(packet);
@@ -935,6 +1056,7 @@ class ConnectionService extends ChangeNotifier {
       port: DeviceId.lastServerPort ?? 8765,
       name: name,
       accountId: DeviceId.accountId,
+      useTls: DeviceId.lastUseTls,
     );
   }
 
@@ -965,6 +1087,7 @@ class ConnectionService extends ChangeNotifier {
     pending = [];
     groups = [];
     messages = [];
+    pins = [];
     mediaCache.clear();
     currentGroupId = 'global';
     typingUser = null;

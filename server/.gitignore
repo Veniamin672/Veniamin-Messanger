@@ -1,0 +1,6 @@
+data/
+certs/
+__pycache__/
+.venv/
+venv/
+*.pyc

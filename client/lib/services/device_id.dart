@@ -23,6 +23,7 @@ class DeviceId {
   static const _lastPortKey = 'veniamin_last_port';
   static const _lastNameKey = 'veniamin_last_name';
   static const _autoConnectKey = 'veniamin_auto_connect';
+  static const _useTlsKey = 'veniamin_use_tls';
   static String? _uuid;
   static String? _accountId;
   static List<KnownAccount> knownAccounts = [];
@@ -31,6 +32,8 @@ class DeviceId {
   static String? lastDisplayName;
   /// true = после входа помнить сессию и автоподключаться; false после явного disconnect
   static bool wantAutoConnect = false;
+  /// Использовать wss:// (TLS). По умолчанию true.
+  static bool lastUseTls = true;
 
   static Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
@@ -44,6 +47,7 @@ class DeviceId {
     lastServerPort = prefs.getInt(_lastPortKey);
     lastDisplayName = prefs.getString(_lastNameKey);
     wantAutoConnect = prefs.getBool(_autoConnectKey) ?? false;
+    lastUseTls = prefs.getBool(_useTlsKey) ?? true;
     await _loadKnown(prefs);
   }
 
@@ -126,6 +130,7 @@ class DeviceId {
     required String host,
     required int port,
     String? name,
+    bool? useTls,
   }) async {
     lastServerHost = host.trim();
     lastServerPort = port;
@@ -135,6 +140,10 @@ class DeviceId {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_lastHostKey, lastServerHost!);
     await prefs.setInt(_lastPortKey, lastServerPort!);
+    if (useTls != null) {
+      lastUseTls = useTls;
+      await prefs.setBool(_useTlsKey, useTls);
+    }
     if (lastDisplayName != null && lastDisplayName!.isNotEmpty) {
       await prefs.setString(_lastNameKey, lastDisplayName!);
     }
@@ -146,6 +155,7 @@ class DeviceId {
     lastServerPort = prefs.getInt(_lastPortKey);
     lastDisplayName = prefs.getString(_lastNameKey);
     wantAutoConnect = prefs.getBool(_autoConnectKey) ?? false;
+    lastUseTls = prefs.getBool(_useTlsKey) ?? true;
   }
 
   static Future<void> setAutoConnect(bool value) async {

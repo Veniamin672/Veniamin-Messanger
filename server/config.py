@@ -3,6 +3,14 @@
 HOST = "0.0.0.0"
 PORT = 8765
 
+# TLS / WSS (рекомендуется). Сертификаты: server/certs/
+# Сгенерировать: python generate_certs.py  или  generate_certs.bat / .sh
+USE_TLS = True
+SSL_CERTFILE = "certs/cert.pem"
+SSL_KEYFILE = "certs/key.pem"
+# Если сертификатов нет и USE_TLS=True — сервер упадёт с подсказкой
+# (для отладки без TLS поставьте USE_TLS = False)
+
 # Paths
 DATA_DIR = "data"
 USERS_FILE = "data/users.json"
@@ -11,11 +19,13 @@ MEDIA_DIR = "data/media"
 PENDING_FILE = "data/pending.json"
 ADMIN_UUID_FILE = "data/admin_uuid.txt"
 GROUPS_FILE = "data/groups.json"
+PINS_FILE = "data/pins.json"
 
 # Retention (hours)
 MESSAGE_RETENTION_HOURS = 7 * 24      # 7 days
 FILE_PHOTO_RETENTION_HOURS = 3 * 24   # 3 days
 VIDEO_RETENTION_HOURS = 24            # 1 day
+PINNED_RETENTION_HOURS = 30 * 24      # pinned keep 30 days
 
 # Cleanup time (server local time)
 CLEANUP_HOUR = 3
@@ -30,9 +40,11 @@ MAX_MESSAGE_SIZE = 1024 * 1024        # 1 MB text
 MAX_FILE_SIZE = 25 * 1024 * 1024      # 25 MB (base64 friendly)
 MAX_USERS = 20
 MAX_GROUPS = 50
+MAX_PINS_GLOBAL = 50
+MAX_PINS_GROUP = 20
 
 # Admin hard-coded reset password
-ADMIN_RESET_PASSWORD = "3648"
+ADMIN_RESET_PASSWORD = "4593"
 
 # Default global group id
 GLOBAL_GROUP_ID = "global"
