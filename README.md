@@ -26,13 +26,21 @@ veniamin/
 │   ├── config.py
 │   ├── protocol.py
 │   ├── storage.py
-│   └── requirements.txt
+│   ├── generate_certs.py
+│   ├── reset_data.py       # полный сброс всех данных через удаление папки data/
+│   ├── requirements.txt
+│   ├── run.sh
+│   ├── run.bat            # запуск сервера
+│   ├── generate_certs.sh
+│   └── generate_certs.bat # получение сертификата WSS, обязательно запустить перед первым запуском сервера если WSS включён
 ├── client/                 # Flutter-клиент
 │   ├── lib/
 │   │   ├── main.dart
 │   │   ├── theme.dart
 │   │   ├── services/
 │   │   │   ├── connection.dart
+│   │   │   ├── device_id.dart
+│   │   │   ├── local_labels.dart
 │   │   │   └── device_id.dart
 │   │   └── screens/
 │   │       ├── connect_screen.dart
@@ -41,12 +49,20 @@ veniamin/
 │   │       └── call_screen.dart
 │   └── pubspec.yaml
 └── docs/
-    └── protocol.md
+    ├── README.md
+    ├── SETUP.md
+    ├── protocol.md
+    ├── ANDROID.md
+    ├── ANDROID_FILE_PICKER_FIX.md
+    ├── ANDROID_FIX.md
+    └── ANDROID_PERMISSIONS.md
 ```
 
 ---
 
 ## Запуск сервера
+
+Перед первым запуском стоит запустить `generate_certs.bat` на Windows и `generate_certs.sh` на Linux для создания сертификатов WSS. WSS можно отключить в `server/config.py`, тогда сертификаты становятся необязательными.
 
 ```bash
 cd server
@@ -61,6 +77,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 python server.py
 ```
+
 
 Или файлом run.bat на Windows и run.sh на Linux
 
@@ -109,6 +126,7 @@ hostname -I
 ```
 )
 2. **port** (по умолчанию 8765, но можно изменить в `server/config.py`)
+3. **WSS** функция защиты передачи пакетов от посредника, включить или выключить в зависимости от настроек сервера указанных в `server/config.py`
 3. **display name**
 4. Отображается **device_uuid** (можно скопировать)
 5. Отображается **account_id** (также можно скопировать, нужен для смены аккаунта)
@@ -143,6 +161,7 @@ hostname -I
 | `call_incoming` / `call_answered` / `call_ice_candidate` / `call_ended` | звонки |
 
 Подробнее: `docs/protocol.md`.
+Пока устаревший, были добавлены новые типы пакетов.
 
 ---
 
@@ -227,3 +246,9 @@ flutter build ipa --release
 - Admin: system broadcast всем
 - Admin: полный сброс сообщений (пароль `3648` можно настроить через server/config.py)
 - Тема: #1E1E1E / #252526 / #007c42 / #D4D4D4 / #808080
+
+## Новое в v1.2
+- Таймер звонка
+- Mesh(групповой звонок)
+- Настройки вывода звука звонка
+- WSS соединение(защита передачи пакетов от посредника)
